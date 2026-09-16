@@ -97,6 +97,8 @@ const validateCreateServer = ajv.compile({
     token: { type: "string", minLength: 1 },
     deploy_mode: { type: "string", enum: ["all", "license_only", "version_only"] },
     version_uuid: { type: "string", minLength: 1 },
+    duration_days: { type: "integer", minimum: 1, maximum: 3650 },
+    billing_period: { type: "string", enum: ["monthly", "annual"] },
   },
 });
 
@@ -128,8 +130,27 @@ const validateUpgradeLicense = ajv.compile({
     ssh_port: { anyOf: [{ type: "string", minLength: 1 }, { type: "number" }] },
     token: { type: "string", minLength: 1 },
     license_type: { type: "string", minLength: 1 },
+    duration_days: { type: "integer", minimum: 1, maximum: 3650 },
+    billing_period: { type: "string", enum: ["monthly", "annual"] },
   },
 });
+
+/** Resolve license duration: trial stays at type default; paid tiers honor billing_period / duration_days. */
+function resolveDurationDays(licenseType, body = {}) {
+  const lt = String(licenseType || "").toLowerCase();
+  const defaults = LICENSE_TYPES[lt];
+  if (!defaults) return null;
+  if (lt === "trial") return defaults.durationDays;
+
+  const explicitRaw = body.duration_days;
+  const explicit = Number(explicitRaw);
+  if (Number.isFinite(explicit) && explicit > 0) return Math.round(explicit);
+
+  const period = String(body.billing_period || "").toLowerCase();
+  if (period === "monthly") return 30;
+  if (period === "annual") return 365;
+  return defaults.durationDays;
+}
 
 async function appendSessionLog(ip, token, event, payload = {}) {
   await fs.mkdir(LOG_DIR, { recursive: true });
@@ -662,8 +683,17 @@ app.post("/upgrade_license", async (req, res) => {
       user,
       ssh_port,
       license_type: lt,
+      billing_period: req.body.billing_period || null,
+      duration_days: resolveDurationDays(lt, req.body),
     });
-    await appendSessionLog(ip, token, "upgrade_license_received", { name, ssh_port, license_type: lt });
+    const durationDays = resolveDurationDays(lt, req.body);
+    await appendSessionLog(ip, token, "upgrade_license_received", {
+      name,
+      ssh_port,
+      license_type: lt,
+      billing_period: req.body.billing_period || null,
+      duration_days: durationDays,
+    });
 
     let genOut;
     try {
@@ -673,7 +703,7 @@ app.post("/upgrade_license", async (req, res) => {
         pass,
         sshPort: ssh_port,
         licenseType: lt,
-        durationDays: ltConfig.durationDays,
+        durationDays,
         feature: ltConfig.feature,
         logContext,
       });
@@ -713,11 +743,11 @@ app.post("/upgrade_license", async (req, res) => {
       licenseContent,
       pubKey,
       privateKey,
-      durationDays: ltConfig.durationDays,
+      durationDays,
     });
     await writeHistory(
       rowUuid,
-      `${lt} license upgraded (feature=${ltConfig.feature}, duration=${ltConfig.durationDays}d) for machine_id=${machineId} ip=${ip}`
+      `${lt} license upgraded (feature=${ltConfig.feature}, duration=${durationDays}d) for machine_id=${machineId} ip=${ip}`
     );
     deployLog("info", reqId, "upgrade_license DB row updated", { rowUuid, machineId });
 
@@ -1072,7 +1102,13 @@ app.post("/create_server", async (req, res) => {
 
   let workDir;
   try {
-    await appendSessionLog(ip, token, "create_server_received", { name, ssh_port, license_type: lt });
+    await appendSessionLog(ip, token, "create_server_received", {
+      name,
+      ssh_port,
+      license_type: lt,
+      billing_period: req.body.billing_period || null,
+      duration_days: resolveDurationDays(lt, req.body),
+    });
 
     try {
       await fs.access(MACHINE_ID_BIN);
@@ -1113,9 +1149,11 @@ app.post("/create_server", async (req, res) => {
     let publicKeyPath;
 
     if (!reuseExistingLicense) {
+      const durationDays = resolveDurationDays(lt, req.body);
       deployLog("info", reqId, `license path: generate new ${lt} license`, {
         feature: ltConfig.feature,
-        durationDays: ltConfig.durationDays,
+        durationDays,
+        billing_period: req.body.billing_period || null,
       });
       let genOut;
       try {
@@ -1125,7 +1163,7 @@ app.post("/create_server", async (req, res) => {
           pass,
           sshPort: ssh_port,
           licenseType: lt,
-          durationDays: ltConfig.durationDays,
+          durationDays,
           feature: ltConfig.feature,
           logContext,
         });
@@ -1167,11 +1205,11 @@ app.post("/create_server", async (req, res) => {
         pubKey,
         privateKey,
         token,
-        durationDays: ltConfig.durationDays,
+        durationDays,
       });
       await writeHistory(
         rowUuid,
-        `${lt} license generated (feature=${ltConfig.feature}, duration=${ltConfig.durationDays}d) for machine_id=${machineId} ip=${ip}`
+        `${lt} license generated (feature=${ltConfig.feature}, duration=${durationDays}d) for machine_id=${machineId} ip=${ip}`
       );
       deployLog("info", reqId, `${lt} license row inserted`, { rowUuid, machineId });
 
