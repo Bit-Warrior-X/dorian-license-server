@@ -100,8 +100,20 @@ else
   FETCHED_REMOTE=1
   [[ -n "$IP" && -n "$USER" && -n "$PASS" && -n "$SSH_PORT" ]] || fail "without --machine_id, --ip, --user, --pass, and --ssh_port are required"
   [[ -x "$GET_REMOTE" || -f "$GET_REMOTE" ]] || fail "missing get_remote script: ${GET_REMOTE}"
-  remote_out=$("$GET_REMOTE" "$IP" "$USER" "$PASS" "$SSH_PORT" 2>/dev/null) || fail "failed to get remote machine id"
+  remote_err_file="$(mktemp)"
+  set +e
+  remote_out=$("$GET_REMOTE" "$IP" "$USER" "$PASS" "$SSH_PORT" 2>"$remote_err_file")
+  remote_rc=$?
+  set -e
+  remote_err="$(tr '\n\r' '  ' <"$remote_err_file" | sed 's/  */ /g; s/^[[:space:]]*//; s/[[:space:]]*$//')"
+  rm -f "$remote_err_file"
+  if [[ "$remote_rc" -ne 0 ]]; then
+    detail="${remote_err:-SSH or machine_id probe failed}"
+    detail="${detail#error: }"
+    fail "could not obtain machine id from ${USER}@${IP}:${SSH_PORT}: ${detail}. Verify SSH access or try a different server"
+  fi
   MACHINE_ID="$(printf '%s' "$remote_out" | sed -n 's/^machine_id:[[:space:]]*//p' | tail -n1 | tr -d '\r\n[:space:]')"
+  [[ -n "$MACHINE_ID" ]] || fail "empty machine id from ${USER}@${IP}:${SSH_PORT}. The host may be unreachable or incompatible — try another server"
 fi
 
 MACHINE_ID="$(printf '%s' "$MACHINE_ID" | tr -d '\r\n[:space:]')"

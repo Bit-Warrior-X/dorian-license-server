@@ -53,6 +53,22 @@ function deployLog(level, reqId, msg, meta = null) {
   }
 }
 
+/** Ensure error JSON always has a customer-facing `message` (dashboard reads this). */
+function withDeployErrorMessage(payload = {}) {
+  const p = { ...payload };
+  const message = String(
+    p.message || p.script_error || p.error || p.description || "deploy failed"
+  ).trim();
+  p.message = message;
+  if (!p.description) p.description = message;
+  if (p.code == null) p.code = 5000;
+  return p;
+}
+
+function sendDeployError(res, status, payload) {
+  return res.status(status).json(withDeployErrorMessage(payload));
+}
+
 /** Redact sshpass -p PASSWORD for logs */
 function argvForLog(cmd, args) {
   const parts = [cmd, ...args];
@@ -304,9 +320,11 @@ function runGenerateLicenseScript({ ip, user, pass, sshPort, licenseType, durati
         return;
       }
       if (last.startsWith("error: ")) {
+        const scriptError = last.slice("error: ".length).trim();
         const payload = {
           description: "generate_license.sh failed",
-          script_error: last.slice("error: ".length).trim(),
+          message: scriptError,
+          script_error: scriptError,
           stdout: stdout.trim(),
           stderr: stderr.trim(),
           exit_code: code,
@@ -319,9 +337,11 @@ function runGenerateLicenseScript({ ip, user, pass, sshPort, licenseType, durati
         reject(err);
         return;
       }
+      const scriptError = stderr.trim() || stdout.trim() || `unexpected exit code ${code}`;
       const payload = {
         description: "generate_license.sh failed",
-        script_error: stderr.trim() || stdout.trim() || `unexpected exit code ${code}`,
+        message: scriptError,
+        script_error: scriptError,
         stdout: stdout.trim(),
         stderr: stderr.trim(),
         exit_code: code,
@@ -711,11 +731,12 @@ app.post("/upgrade_license", async (req, res) => {
       deployLog("error", reqId, "generate_license failed", { message: e.message });
       await appendSessionLog(ip, token, "upgrade_license_generate_failed", e.generateLicensePayload || { error: e.message });
       if (e.generateLicensePayload) {
-        return res.status(500).json({ code: 5000, ...e.generateLicensePayload });
+        return sendDeployError(res, 500, { code: 5000, ...e.generateLicensePayload });
       }
-      return res.status(500).json({
+      return sendDeployError(res, 500, {
         code: 5000,
         description: "generate_license.sh failed",
+        message: e.message || "generate_license.sh failed",
         error: e.message,
         stderr: e.stderr,
         stdout: e.stdout,
@@ -1171,11 +1192,12 @@ app.post("/create_server", async (req, res) => {
         deployLog("error", reqId, "generate_license failed", { message: e.message });
         await appendSessionLog(ip, token, "generate_license_failed", e.generateLicensePayload || { error: e.message });
         if (e.generateLicensePayload) {
-          return res.status(500).json({ code: 5000, ...e.generateLicensePayload });
+          return sendDeployError(res, 500, { code: 5000, ...e.generateLicensePayload });
         }
-        return res.status(500).json({
+        return sendDeployError(res, 500, {
           code: 5000,
           description: "generate_license.sh failed",
+          message: e.message || "generate_license.sh failed",
           error: e.message,
           stderr: e.stderr,
           stdout: e.stdout,
@@ -1223,7 +1245,11 @@ app.post("/create_server", async (req, res) => {
       if (!rows.length) {
         deployLog("warn", reqId, "license_string not found in DB");
         await appendSessionLog(ip, token, "license_validation_failed", { reason: "license_string not found" });
-        return res.status(404).json({ description: "license not found" });
+        return sendDeployError(res, 404, {
+          description: "license not found",
+          message:
+            "The selected license was not found. Load a valid license file or generate a new license for this host.",
+        });
       }
       const row = rows[0];
       rowUuid = row.uuid;
@@ -1233,9 +1259,11 @@ app.post("/create_server", async (req, res) => {
       privateKey = row.private_key;
       if (!pubKey || licenseContent == null || licenseContent === "") {
         deployLog("error", reqId, "license row missing pub_key or license content", { rowId: row.id });
-        return res.status(500).json({
+        return sendDeployError(res, 500, {
           code: 5000,
           description: "license row is missing license or pub_key data",
+          message:
+            "The stored license record is incomplete. Generate a new license for this host or try a different server.",
         });
       }
 
@@ -1384,14 +1412,16 @@ app.post("/create_server", async (req, res) => {
       stack: error.stack ? String(error.stack).split("\n").slice(0, 4).join(" | ") : undefined,
     });
     if (error.code === "NO_VERSION") {
-      return res.status(500).json({
+      return sendDeployError(res, 500, {
         code: 5000,
         description: error.message,
+        message: error.message,
       });
     }
-    return res.status(500).json({
+    return sendDeployError(res, 500, {
       code: 5000,
       description: "create_server failed",
+      message: error.message || "create_server failed",
       error: error.message,
     });
   } finally {
