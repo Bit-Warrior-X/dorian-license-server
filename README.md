@@ -1,10 +1,10 @@
 # deploy_license
 
 HTTP API service for provisioning Dorian DDoS Firewall installations on remote
-servers. It generates a machine-bound license, uploads the product tarball,
-license tarball, and GeoIP database over SSH, then runs `deploy.sh` on the
-target host to extract artifacts and bring up the `angelos`, `athens`, and
-`sparta` systemd services.
+servers. It generates a machine-bound license, uploads the product tarball and
+license tarball over SSH, then runs `deploy.sh` on the target host. GeoIP is
+downloaded separately by the target from `192.142.44.204` (not SCP'd). The
+script brings up the `angelos`, `athens`, and `sparta` systemd services.
 
 Built with Node.js / Express 5 and MySQL.
 
@@ -26,7 +26,8 @@ Built with Node.js / Express 5 and MySQL.
   - `version_only` — Dorian tarball only, plus venv and systemd units.
 - Tracks servers, product versions, and an audit history in MySQL
   (`license`, `versions`, `history` tables).
-- Per-request logging plus per-session log files in `logs/`.
+- Structured JSON logging under `/var/dorian/logs` (process logs, daily JSONL,
+  per-deploy session files).
 - Swagger UI for interactive API exploration at `/docs`.
 
 ---
@@ -86,11 +87,13 @@ cp .env.example .env
 | `DB_USER`     | `root`      | MySQL user                                   |
 | `DB_PASSWORD` | (empty)     | MySQL password                               |
 | `DB_NAME`     | `lic`       | MySQL database                               |
-| `LOG_DIR`     | `./logs`    | Directory for per-session log files          |
+| `LOG_DIR`     | `/var/dorian/logs` | Directory for JSONL + per-session log files |
+| `GEODB_DOWNLOAD_URL` | `http://192.142.44.204/geodb/dbip-full-2026-02.mmdb.tar.gz` | URL edge hosts use to download GeoIP |
 
 Before deploying, also seed the `versions` table with at least one row whose
 `path` points to a readable `dorian-ddos-firewall-*.tar.gz` on the API host,
-and place the GeoIP archive at `bin/geodb/dbip-full-2026-02.mmdb.tar.gz`.
+and place the GeoIP archive at `bin/geodb/dbip-full-2026-02.mmdb.tar.gz`
+(served on `192.142.44.204` for targets to download separately during deploy).
 
 ---
 
@@ -100,14 +103,79 @@ and place the GeoIP archive at `bin/geodb/dbip-full-2026-02.mmdb.tar.gz`.
 npm start
 ```
 
-The server listens on `PORT` (default `9090`). On startup it logs:
+The server listens on `PORT` (default `9090`). On startup it emits a JSON log
+line (also written under `/var/dorian/logs`), for example:
 
-```
-deploy_license API running on port 9090
+```json
+{"ts":"…","level":"info","component":"license-server","event":"listening","msg":"deploy_license API listening","port":9090}
 ```
 
 Swagger UI is served at `http://<host>:<port>/docs` and a basic liveness
 check at `http://<host>:<port>/health`.
+
+---
+
+## Logging
+
+All Dorian control-plane and deploy components write under **`/var/dorian/logs`**.
+Log lines are **one JSON object per line** with common fields such as `ts`,
+`level`, `component`, `event`, `req_id`, and `msg`.
+
+Create the directory once on the control plane (and on edge hosts if you want
+remote `deploy.sh` logs to land there):
+
+```bash
+mkdir -p /var/dorian/logs
+```
+
+Override the license-server directory with `LOG_DIR` in `.env` if needed
+(default is `/var/dorian/logs`). Remote `deploy.sh` uses `DEPLOY_LOG_DIR`
+(default `/var/dorian/logs`).
+
+### Log files
+
+| File / pattern | Component | Contents |
+| -------------- | --------- | -------- |
+| `/var/dorian/logs/backend.log` | Panel Go API | HTTP requests (`http_request`), error responses, deploy_license client calls, other API events |
+| `/var/dorian/logs/license-server.log` | `deploy_license` process | stdout/stderr of `node server.js` (JSON lines) |
+| `/var/dorian/logs/deploy_license-YYYY-MM-DD.jsonl` | `deploy_license` | Daily structured events (SSH/SCP steps, GeoIP background, successes/failures) |
+| `/var/dorian/logs/<ip>__<token>.log` | `deploy_license` | Per-deploy session trail for one host + deployment token |
+| `/var/dorian/logs/deploy-<run_id>.log` | Target `bin/deploy.sh` | Phase timings on the edge (`extract_*`, venv, systemd); `run_id` matches request id when passed via `DEPLOY_RUN_ID` |
+
+Frontend failed API calls also print JSON lines in the browser DevTools console
+(`"component":"frontend"`). Error toasts and the create/upgrade dialogs can
+show expandable technical details (`script_error`, `stderr`, `req_id`, …).
+
+### Correlating a failed deploy
+
+1. Note `req_id` from the UI error details, response header `X-Request-Id`, or
+   the API error JSON field `req_id`.
+2. Search control-plane logs:
+
+```bash
+grep '"req_id":"<REQ_ID>"' /var/dorian/logs/backend.log
+grep '"req_id":"<REQ_ID>"' /var/dorian/logs/license-server.log
+grep '"req_id":"<REQ_ID>"' /var/dorian/logs/deploy_license-*.jsonl
+```
+
+3. Open the matching session file if present:
+
+```bash
+ls /var/dorian/logs/<ip>__*.log
+```
+
+4. On the edge host, check the remote deploy script log:
+
+```bash
+ls /var/dorian/logs/deploy-*.log
+```
+
+Useful filters:
+
+```bash
+grep '"level":"error"' /var/dorian/logs/backend.log /var/dorian/logs/license-server.log
+grep '"event":"http_request"' /var/dorian/logs/backend.log | tail
+```
 
 ---
 
@@ -218,7 +286,14 @@ deploy_license/
 │   ├── geodb/                Holds dbip-full-*.mmdb.tar.gz (gitignored)
 │   ├── licenses/             Generated licenses keyed by machine_id/timestamp
 │   └── secrets/              Server-level keypair (do not commit)
-└── logs/                     Per-session log files (gitignored)
+
+# Runtime logs (not in the repo; default on disk)
+/var/dorian/logs/
+├── backend.log
+├── license-server.log
+├── deploy_license-YYYY-MM-DD.jsonl
+├── <ip>__<token>.log
+└── deploy-<run_id>.log
 ```
 
 ---
@@ -237,10 +312,13 @@ deploy_license/
      signed `license.lic` + public key; update connection fields on that
      row. Returns `404` if no match.
 4. Build `license.tar.gz` containing the license artifacts.
-5. `scp` the Dorian tarball, `license.tar.gz`, GeoIP archive, and `deploy.sh`
-   into `/tmp/dorian_deploy_<token>/` on the target.
-6. Run `bash deploy.sh --<mode>` remotely. On success the staging directory
-   is removed and `athens.service` status is reported back.
+5. `scp` the Dorian tarball, `license.tar.gz`, and `deploy.sh` into
+   `/tmp/dorian_deploy_<token>/` on the target (GeoIP is **not** SCP'd; the
+   target downloads it from `GEODB_DOWNLOAD_URL` / `192.142.44.204` in a
+   background step when needed).
+6. Run `bash deploy.sh --<mode>` remotely (with `GEODB_DEFER=1` on the hot
+   path so create stays under gateway timeouts). On success the staging
+   directory is removed; GeoIP may still be installing in the background.
 7. Persist / update the row in `license` and append a row to `history`.
 
 ---
@@ -254,4 +332,8 @@ deploy_license/
   are passed via process arguments and redacted in logs.
 - License files are stored under `bin/licenses/<machine_id>/<UTC timestamp>/`
   along with an `info.txt` describing the run.
-- `.env`, `logs/`, `node_modules/`, and `bin/geodb/*` are gitignored.
+- `.env`, `node_modules/`, and `bin/geodb/*` are gitignored. Runtime logs live
+  under `/var/dorian/logs` (not the old in-repo `logs/` directory).
+- GeoIP is served over HTTP from this host at
+  `http://192.142.44.204/geodb/dbip-full-2026-02.mmdb.tar.gz` (nginx alias to
+  `bin/geodb/dbip-full-2026-02.mmdb.tar.gz`).

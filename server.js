@@ -27,12 +27,16 @@ app.use((req, res, next) => {
 const PORT = Number(process.env.PORT || 9090);
 const LOG_DIR = process.env.LOG_DIR
   ? path.resolve(process.env.LOG_DIR)
-  : path.join(__dirname, "logs");
+  : "/var/dorian/logs";
 const BIN_DIR = path.join(__dirname, "bin");
 const MACHINE_ID_BIN = path.join(BIN_DIR, "machine_id");
 const GENERATE_LICENSE_SH = path.join(BIN_DIR, "generate_license.sh");
 const DEPLOY_SH = path.join(BIN_DIR, "deploy.sh");
 const GEODB_MMDB_TAR_GZ = path.join(BIN_DIR, "geodb", "dbip-full-2026-02.mmdb.tar.gz");
+/** Edge hosts download GeoIP from this HTTP URL (served from GEODB_MMDB_TAR_GZ on :204). */
+const GEODB_DOWNLOAD_URL =
+  process.env.GEODB_DOWNLOAD_URL ||
+  "http://192.142.44.204/geodb/dbip-full-2026-02.mmdb.tar.gz";
 // Supported license_type values and their generation defaults.
 // Trial is always auto-generated (3-day duration). L4 / L7 / Unified are auto-generated
 // by default but may instead reuse an existing license row when license_string is provided.
@@ -44,17 +48,105 @@ const LICENSE_TYPES = {
 };
 const REMOTE_DEPLOY_PREFIX = "/tmp/dorian_deploy";
 
+/** Truncate large strings for log payloads (keeps head+tail for analysis). */
+function clipForLog(s, max = 4000) {
+  const text = String(s ?? "");
+  if (text.length <= max) return text;
+  const head = Math.floor(max * 0.35);
+  const tail = max - head - 40;
+  return `${text.slice(0, head)}\n…[${text.length - head - Math.max(tail, 0)} bytes omitted]…\n${text.slice(-Math.max(tail, 0))}`;
+}
+
+function safeLogMeta(meta) {
+  if (meta == null || typeof meta !== "object") return {};
+  const out = {};
+  for (const [k, v] of Object.entries(meta)) {
+    if (v === undefined) continue;
+    if (typeof v === "string" && v.length > 8000) {
+      out[k] = clipForLog(v, 8000);
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+/**
+ * Structured deploy logs (one JSON object per line):
+ *  - stdout/stderr for journal / process logs
+ *  - JSONL under /var/dorian/logs/deploy_license-YYYY-MM-DD.jsonl for later analysis
+ */
 function deployLog(level, reqId, msg, meta = null) {
   const ts = new Date().toISOString();
-  if (meta && typeof meta === "object" && Object.keys(meta).length) {
-    console.log(`[deploy_license][${ts}][${level}][req=${reqId}] ${msg}`, meta);
+  const day = ts.slice(0, 10);
+  const payload = {
+    ts,
+    level: String(level || "info"),
+    component: "license-server",
+    event: "log",
+    req_id: reqId || null,
+    msg: String(msg || ""),
+    ...safeLogMeta(meta),
+  };
+  if (meta?.component) payload.component = meta.component;
+  if (meta?.event) payload.event = meta.event;
+  if (meta?.step && !payload.step) payload.step = meta.step;
+
+  const line = JSON.stringify(payload);
+  if (payload.level === "error") {
+    console.error(line);
+  } else if (payload.level === "warn") {
+    console.warn(line);
   } else {
-    console.log(`[deploy_license][${ts}][${level}][req=${reqId}] ${msg}`);
+    console.log(line);
   }
+
+  const jsonlPath = path.join(LOG_DIR, `deploy_license-${day}.jsonl`);
+  fs.mkdir(LOG_DIR, { recursive: true })
+    .then(() => fs.appendFile(jsonlPath, `${line}\n`, "utf8"))
+    .catch((err) => {
+      console.error(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          level: "error",
+          component: "license-server",
+          event: "log_write_failed",
+          path: jsonlPath,
+          msg: err.message,
+        })
+      );
+    });
+}
+
+async function appendSessionLog(ip, token, event, payload = {}) {
+  if (!ip || !token) return;
+  await fs.mkdir(LOG_DIR, { recursive: true });
+  const safeIp = String(ip).replace(/[^a-zA-Z0-9_.-]/g, "_");
+  const safeToken = String(token).replace(/[^a-zA-Z0-9_.-]/g, "_");
+  const filePath = path.join(LOG_DIR, `${safeIp}__${safeToken}.log`);
+  const entry = {
+    ts: new Date().toISOString(),
+    event: String(event || "event"),
+    ...safeLogMeta(payload),
+  };
+  for (const k of Object.keys(entry)) {
+    if (entry[k] === undefined) delete entry[k];
+  }
+  await fs.appendFile(filePath, `${JSON.stringify(entry)}\n`, "utf8");
+}
+
+function sessionFields(logContext = {}) {
+  const out = {};
+  if (logContext.ip) out.ip = logContext.ip;
+  if (logContext.token) out.token = logContext.token;
+  if (logContext.op) out.op = logContext.op;
+  if (logContext.component) out.component = logContext.component;
+  if (logContext.reqId) out.req_id = logContext.reqId;
+  return out;
 }
 
 /** Ensure error JSON always has a customer-facing `message` (dashboard reads this). */
-function withDeployErrorMessage(payload = {}) {
+function withDeployErrorMessage(payload = {}, reqId = null) {
   const p = { ...payload };
   const message = String(
     p.message || p.script_error || p.error || p.description || "deploy failed"
@@ -62,11 +154,15 @@ function withDeployErrorMessage(payload = {}) {
   p.message = message;
   if (!p.description) p.description = message;
   if (p.code == null) p.code = 5000;
+  if (reqId && !p.req_id) p.req_id = reqId;
+  if (p.stderr) p.stderr = clipForLog(p.stderr, 8000);
+  if (p.stdout) p.stdout = clipForLog(p.stdout, 8000);
+  if (p.script_error) p.script_error = clipForLog(p.script_error, 4000);
   return p;
 }
 
-function sendDeployError(res, status, payload) {
-  return res.status(status).json(withDeployErrorMessage(payload));
+function sendDeployError(res, status, payload, reqId = null) {
+  return res.status(status).json(withDeployErrorMessage(payload, reqId));
 }
 
 /** Redact sshpass -p PASSWORD for logs */
@@ -168,15 +264,6 @@ function resolveDurationDays(licenseType, body = {}) {
   return defaults.durationDays;
 }
 
-async function appendSessionLog(ip, token, event, payload = {}) {
-  await fs.mkdir(LOG_DIR, { recursive: true });
-  const safeIp = String(ip).replace(/[^a-zA-Z0-9_.-]/g, "_");
-  const safeToken = String(token).replace(/[^a-zA-Z0-9_.-]/g, "_");
-  const filePath = path.join(LOG_DIR, `${safeIp}__${safeToken}.log`);
-  const line = `${new Date().toISOString()} ${event} ${JSON.stringify(payload)}\n`;
-  await fs.appendFile(filePath, line, "utf8");
-}
-
 async function writeHistory(uuid, description) {
   await dbPool.execute("INSERT INTO history (uuid, description) VALUES (?, ?)", [uuid, description]);
 }
@@ -199,8 +286,14 @@ function licenseExpireToIso(value) {
 function runCommand(cmd, args, options = {}) {
   const { logContext, ...spawnOpts } = options;
   const t0 = Date.now();
+  const step = logContext?.step || "exec";
+  const component = logContext?.component || (String(cmd).includes("scp") ? "scp" : "ssh");
   if (logContext?.reqId) {
-    deployLog("info", logContext.reqId, `exec start: ${argvForLog(cmd, args)}`, { step: logContext.step });
+    deployLog("info", logContext.reqId, `exec start: ${argvForLog(cmd, args)}`, {
+      component,
+      step,
+      ...sessionFields(logContext),
+    });
   }
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, {
@@ -217,33 +310,55 @@ function runCommand(cmd, args, options = {}) {
     });
     child.on("error", (err) => {
       const ms = Date.now() - t0;
+      const meta = {
+        component,
+        step,
+        cmd,
+        duration_ms: ms,
+        error: err.message,
+        ...sessionFields(logContext),
+      };
       if (logContext?.reqId) {
-        deployLog("error", logContext.reqId, `exec spawn error after ${ms}ms: ${err.message}`, {
-          step: logContext.step,
-          cmd: cmd,
-        });
+        deployLog("error", logContext.reqId, `exec spawn error after ${ms}ms: ${err.message}`, meta);
+      }
+      if (logContext?.ip && logContext?.token) {
+        appendSessionLog(logContext.ip, logContext.token, "exec_spawn_error", meta).catch(() => {});
       }
       reject(err);
     });
     child.on("close", (code) => {
       const ms = Date.now() - t0;
+      const meta = {
+        component,
+        step,
+        exit_code: code,
+        duration_ms: ms,
+        stdout_len: stdout.length,
+        stderr_len: stderr.length,
+        stdout: clipForLog(stdout.trim(), 6000),
+        stderr: clipForLog(stderr.trim(), 6000),
+        ...sessionFields(logContext),
+      };
       if (logContext?.reqId) {
-        const tail = (s, n) => (s && s.length > n ? `${s.slice(-n)}…(len=${s.length})` : s || "");
-        deployLog(code === 0 ? "info" : "error", logContext.reqId, `exec end code=${code} in ${ms}ms`, {
-          step: logContext.step,
-          stdoutLen: stdout.length,
-          stderrLen: stderr.length,
-          stderrTail: tail(stderr.trim(), 400),
-        });
+        deployLog(code === 0 ? "info" : "error", logContext.reqId, `exec end code=${code} in ${ms}ms`, meta);
+      }
+      if (logContext?.ip && logContext?.token) {
+        appendSessionLog(
+          logContext.ip,
+          logContext.token,
+          code === 0 ? "exec_ok" : "exec_failed",
+          meta
+        ).catch(() => {});
       }
       if (code === 0) {
-        resolve({ stdout, stderr });
+        resolve({ stdout, stderr, durationMs: ms });
         return;
       }
       const err = new Error(stderr.trim() || stdout.trim() || `${cmd} exited with code ${code}`);
       err.code = code;
       err.stdout = stdout;
       err.stderr = stderr;
+      err.durationMs = ms;
       reject(err);
     });
   });
@@ -401,7 +516,20 @@ function safeRemoteTokenSegment(token) {
     .slice(0, 64);
 }
 
-const SSH_OPTS = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR"];
+const SSH_OPTS = [
+  "-o",
+  "StrictHostKeyChecking=no",
+  "-o",
+  "UserKnownHostsFile=/dev/null",
+  "-o",
+  "LogLevel=ERROR",
+  "-o",
+  "ConnectTimeout=20",
+  "-o",
+  "ServerAliveInterval=15",
+  "-o",
+  "ServerAliveCountMax=4",
+];
 
 async function ensureRemoteDir({ ip, user, pass, sshPort, remoteDir, logContext }) {
   await runCommand(
@@ -444,11 +572,179 @@ async function scpFilesToRemote({ ip, user, pass, sshPort, localFiles, remoteDir
     return;
   }
   const dest = `${user}@${ip}:${remoteDir}/`;
+  const fileMeta = [];
+  for (const f of localFiles) {
+    try {
+      const st = await fs.stat(f);
+      fileMeta.push({ name: path.basename(f), bytes: st.size });
+    } catch {
+      fileMeta.push({ name: path.basename(f), bytes: null });
+    }
+  }
   await runCommand(
     "sshpass",
     ["-p", String(pass), "scp", ...SSH_OPTS, "-P", String(sshPort), ...localFiles, dest],
-    { logContext: { ...logContext, step: "scp_upload", fileCount: localFiles.length } }
+    {
+      logContext: {
+        ...logContext,
+        component: "scp",
+        step: "scp_upload",
+        fileCount: localFiles.length,
+        files: fileMeta,
+      },
+    }
   );
+}
+
+/** True when the remote already has GeoIP MMDB files (skip re-uploading ~480MB). */
+async function remoteGeodbInstalled({ ip, user, pass, sshPort, logContext }) {
+  try {
+    await runCommand(
+      "sshpass",
+      [
+        "-p",
+        String(pass),
+        "ssh",
+        ...SSH_OPTS,
+        "-p",
+        String(sshPort),
+        `${user}@${ip}`,
+        "find /usr/local/share/dorian/athens/nginx/lua/geoip2 -type f -name '*.mmdb' 2>/dev/null | head -1 | grep -q .",
+      ],
+      { logContext: { ...logContext, step: "ssh_check_geodb" } }
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Build the sync SCP file list. Never includes the ~480MB GeoIP archive —
+ * targets download it from GEODB_DOWNLOAD_URL (192.142.44.204) separately.
+ * When GeoIP is still needed on the host, set deferGeodb so the caller can
+ * schedule a background install after the HTTP response (Cloudflare ~100s).
+ */
+async function buildRemoteUploadFiles({
+  tarballPath,
+  productPath,
+  includeGeodb,
+  ip,
+  user,
+  pass,
+  sshPort,
+  logContext,
+}) {
+  const localFiles = [tarballPath, productPath, DEPLOY_SH].filter(Boolean);
+  let deferGeodb = false;
+  if (includeGeodb) {
+    const already = await remoteGeodbInstalled({ ip, user, pass, sshPort, logContext });
+    if (already) {
+      deployLog("info", logContext?.reqId, "skipping GeoIP; MMDB already present on remote");
+    } else {
+      deferGeodb = true;
+      deployLog("info", logContext?.reqId, "deferring GeoIP download from mirror", {
+        url: GEODB_DOWNLOAD_URL,
+      });
+    }
+  }
+  return { localFiles, deferGeodb };
+}
+
+/** Background: target curls GeoIP from 192.142.44.204 and extracts it. */
+async function installRemoteGeodb({ ip, user, pass, sshPort, logContext }) {
+  const t0 = Date.now();
+  deployLog("info", logContext?.reqId, "background GeoIP download starting", {
+    component: "geodb",
+    url: GEODB_DOWNLOAD_URL,
+    ...sessionFields(logContext),
+  });
+  if (logContext?.ip && logContext?.token) {
+    await appendSessionLog(logContext.ip, logContext.token, "geodb_background_start", {
+      component: "geodb",
+      url: GEODB_DOWNLOAD_URL,
+      req_id: logContext.reqId,
+    });
+  }
+  if (await remoteGeodbInstalled({ ip, user, pass, sshPort, logContext })) {
+    deployLog("info", logContext?.reqId, "background GeoIP skipped; MMDB already present", {
+      component: "geodb",
+      duration_ms: Date.now() - t0,
+      ...sessionFields(logContext),
+    });
+    return;
+  }
+  const geoDir = "/usr/local/share/dorian/athens/nginx/lua/geoip2";
+  const remoteTar = "/tmp/dbip-full-2026-02.mmdb.tar.gz";
+  const urlJson = JSON.stringify(GEODB_DOWNLOAD_URL);
+  const remoteShell = [
+    `mkdir -p -- ${JSON.stringify(geoDir)}`,
+    `if command -v curl >/dev/null 2>&1; then curl -fsSL --connect-timeout 20 --retry 3 -o ${JSON.stringify(remoteTar)} ${urlJson}; ` +
+      `elif command -v wget >/dev/null 2>&1; then wget -q -O ${JSON.stringify(remoteTar)} ${urlJson}; ` +
+      `else echo "curl/wget required to download GeoIP" >&2; exit 1; fi`,
+    `tar -xzf ${JSON.stringify(remoteTar)} -C ${JSON.stringify(geoDir)}`,
+    `rm -f -- ${JSON.stringify(remoteTar)}`,
+    `echo "geodb_ok files=$(find ${JSON.stringify(geoDir)} -name '*.mmdb' | wc -l)"`,
+  ].join(" && ");
+  await runCommand(
+    "sshpass",
+    [
+      "-p",
+      String(pass),
+      "ssh",
+      ...SSH_OPTS,
+      "-p",
+      String(sshPort),
+      `${user}@${ip}`,
+      remoteShell,
+    ],
+    {
+      logContext: {
+        ...logContext,
+        component: "geodb",
+        step: "ssh_download_geodb_background",
+      },
+    }
+  );
+  deployLog("info", logContext?.reqId, "background GeoIP install completed", {
+    component: "geodb",
+    geoDir,
+    url: GEODB_DOWNLOAD_URL,
+    duration_ms: Date.now() - t0,
+    ...sessionFields(logContext),
+  });
+  if (logContext?.ip && logContext?.token) {
+    await appendSessionLog(logContext.ip, logContext.token, "geodb_background_ok", {
+      component: "geodb",
+      url: GEODB_DOWNLOAD_URL,
+      duration_ms: Date.now() - t0,
+      req_id: logContext.reqId,
+    });
+  }
+}
+
+function scheduleRemoteGeodbInstall(opts) {
+  setImmediate(() => {
+    installRemoteGeodb(opts).catch((err) => {
+      deployLog("warn", opts.logContext?.reqId, `background GeoIP install failed: ${err.message}`, {
+        component: "geodb",
+        code: err.code,
+        stdout: clipForLog(err.stdout || "", 4000),
+        stderr: clipForLog(err.stderr || "", 4000),
+        ...sessionFields(opts.logContext || {}),
+      });
+      if (opts.logContext?.ip && opts.logContext?.token) {
+        appendSessionLog(opts.logContext.ip, opts.logContext.token, "geodb_background_failed", {
+          component: "geodb",
+          error: err.message,
+          code: err.code,
+          stdout: clipForLog(err.stdout || "", 4000),
+          stderr: clipForLog(err.stderr || "", 4000),
+          req_id: opts.logContext.reqId,
+        }).catch(() => {});
+      }
+    });
+  });
 }
 
 /**
@@ -496,13 +792,36 @@ function deployModeToRemoteFlag(deployMode) {
   return null;
 }
 
-async function runRemoteDeployScript({ ip, user, pass, sshPort, remoteDir, deployFlag, logContext }) {
-  const remoteShell = `cd -- ${JSON.stringify(remoteDir)} && bash deploy.sh ${deployFlag}`;
-  await runCommand(
+async function runRemoteDeployScript({ ip, user, pass, sshPort, remoteDir, deployFlag, env = {}, logContext }) {
+  const envPrefix = Object.entries(env)
+    .filter(([, v]) => v != null && v !== "")
+    .map(([k, v]) => `${k}=${JSON.stringify(String(v))}`)
+    .join(" ");
+  const remoteShell = `cd -- ${JSON.stringify(remoteDir)} && ${envPrefix ? `${envPrefix} ` : ""}bash deploy.sh ${deployFlag}`;
+  const result = await runCommand(
     "sshpass",
     ["-p", String(pass), "ssh", ...SSH_OPTS, "-p", String(sshPort), `${user}@${ip}`, remoteShell],
-    { logContext: { ...logContext, step: "ssh_remote_deploy", deployFlag } }
+    {
+      logContext: {
+        ...logContext,
+        component: "deploy.sh",
+        step: "ssh_remote_deploy",
+        deployFlag,
+      },
+    }
   );
+  if (logContext?.ip && logContext?.token) {
+    await appendSessionLog(logContext.ip, logContext.token, "remote_deploy_output", {
+      component: "deploy.sh",
+      deploy_flag: deployFlag,
+      remote_dir: remoteDir,
+      duration_ms: result.durationMs,
+      stdout: clipForLog(result.stdout || "", 12000),
+      stderr: clipForLog(result.stderr || "", 4000),
+      req_id: logContext.reqId,
+    });
+  }
+  return result;
 }
 
 app.get("/get_versions", async (req, res) => {
@@ -639,7 +958,7 @@ async function updateLicenseRowByTokenGenerate({
 app.post("/upgrade_license", async (req, res) => {
   const { name, ip, user, pass, ssh_port, license_type, token } = req.body;
   const reqId = req._reqId || crypto.randomUUID();
-  const logContext = { reqId };
+  const logContext = { reqId, ip, token, op: "upgrade_license" };
 
   if (!validateUpgradeLicense(req.body)) {
     deployLog("warn", reqId, "validation failed for upgrade_license", {
@@ -685,15 +1004,6 @@ app.post("/upgrade_license", async (req, res) => {
       return res.status(500).json({
         code: 5000,
         description: `missing deploy script at ${DEPLOY_SH}`,
-      });
-    }
-    try {
-      await fs.access(GEODB_MMDB_TAR_GZ);
-    } catch {
-      deployLog("error", reqId, "missing GeoIP archive", { path: GEODB_MMDB_TAR_GZ });
-      return res.status(500).json({
-        code: 5000,
-        description: `missing GeoIP database archive at ${GEODB_MMDB_TAR_GZ}`,
       });
     }
 
@@ -814,12 +1124,22 @@ app.post("/upgrade_license", async (req, res) => {
       product: path.basename(productPath),
     });
     await ensureRemoteDir({ ip, user, pass, sshPort: ssh_port, remoteDir, logContext });
+    const { localFiles: upgradeLicenseFiles } = await buildRemoteUploadFiles({
+      tarballPath,
+      productPath,
+      includeGeodb: false,
+      ip,
+      user,
+      pass,
+      sshPort: ssh_port,
+      logContext,
+    });
     await scpFilesToRemote({
       ip,
       user,
       pass,
       sshPort: ssh_port,
-      localFiles: [tarballPath, productPath, DEPLOY_SH, GEODB_MMDB_TAR_GZ],
+      localFiles: upgradeLicenseFiles,
       remoteDir,
       logContext,
     });
@@ -868,12 +1188,7 @@ app.post("/upgrade_license", async (req, res) => {
       remote_dir: remoteDir,
       deploy_mode: effectiveDeployMode,
       remote_deploy_flag: remoteDeployFlag,
-      uploaded_files: [
-        "license.tar.gz",
-        path.basename(productPath),
-        path.basename(DEPLOY_SH),
-        path.basename(GEODB_MMDB_TAR_GZ),
-      ],
+      uploaded_files: upgradeLicenseFiles.map((f) => path.basename(f)),
       dorian_version: {
         version: versionRow.version,
         full_name: versionRow.full_name,
@@ -905,7 +1220,7 @@ app.post("/upgrade_license", async (req, res) => {
 app.post("/upgrade_version", async (req, res) => {
   const { name, ip, user, pass, ssh_port, token, version_uuid, license_type } = req.body;
   const reqId = req._reqId || crypto.randomUUID();
-  const logContext = { reqId };
+  const logContext = { reqId, ip, token, op: "upgrade_version" };
 
   if (!validateUpgradeVersion(req.body)) {
     deployLog("warn", reqId, "validation failed for upgrade_version", {
@@ -1107,7 +1422,7 @@ app.post("/create_server", async (req, res) => {
   }
   const reuseExistingLicense = hasLicenseString;
 
-  const logContext = { reqId };
+  const logContext = { reqId, ip, token, op: "create_server" };
   deployLog("info", reqId, "create_server accepted", {
     name,
     ip,
@@ -1148,16 +1463,6 @@ app.post("/create_server", async (req, res) => {
       return res.status(500).json({
         code: 5000,
         description: `missing deploy script at ${DEPLOY_SH}`,
-      });
-    }
-
-    try {
-      await fs.access(GEODB_MMDB_TAR_GZ);
-    } catch {
-      deployLog("error", reqId, "missing GeoIP archive", { path: GEODB_MMDB_TAR_GZ });
-      return res.status(500).json({
-        code: 5000,
-        description: `missing GeoIP database archive at ${GEODB_MMDB_TAR_GZ}`,
       });
     }
 
@@ -1325,19 +1630,29 @@ app.post("/create_server", async (req, res) => {
       product: path.basename(productPath),
     });
     await ensureRemoteDir({ ip, user, pass, sshPort: ssh_port, remoteDir, logContext });
+    const { localFiles: createServerFiles, deferGeodb } = await buildRemoteUploadFiles({
+      tarballPath,
+      productPath,
+      includeGeodb: true,
+      ip,
+      user,
+      pass,
+      sshPort: ssh_port,
+      logContext,
+    });
     await scpFilesToRemote({
       ip,
       user,
       pass,
       sshPort: ssh_port,
-      localFiles: [tarballPath, productPath, DEPLOY_SH, GEODB_MMDB_TAR_GZ],
+      localFiles: createServerFiles,
       remoteDir,
       logContext,
     });
 
     const effectiveDeployMode = deploy_mode == null || deploy_mode === "" ? "all" : String(deploy_mode).toLowerCase();
     const remoteDeployFlag = deployFlag || "--all";
-    deployLog("info", reqId, "running remote deploy.sh", { remoteDeployFlag, remoteDir });
+    deployLog("info", reqId, "running remote deploy.sh", { remoteDeployFlag, remoteDir, deferGeodb });
     let serviceDeployWarning = null;
     try {
       await runRemoteDeployScript({
@@ -1347,6 +1662,11 @@ app.post("/create_server", async (req, res) => {
         sshPort: ssh_port,
         remoteDir,
         deployFlag: remoteDeployFlag,
+        env: {
+          GEODB_DOWNLOAD_URL,
+          DEPLOY_RUN_ID: reqId,
+          ...(deferGeodb ? { GEODB_DEFER: "1" } : {}),
+        },
         logContext,
       });
     } catch (remoteErr) {
@@ -1360,18 +1680,31 @@ app.post("/create_server", async (req, res) => {
       });
     }
 
+    if (deferGeodb) {
+      scheduleRemoteGeodbInstall({
+        ip,
+        user,
+        pass,
+        sshPort: ssh_port,
+        logContext,
+      });
+    }
+
     await appendSessionLog(ip, token, serviceDeployWarning ? "create_server_completed_with_service_warning" : "create_server_completed", {
       remoteDir,
       version: versionRow.version,
       license_type: lt,
       deploy_mode: effectiveDeployMode,
+      ...(deferGeodb ? { geodb_install: "background", geodb_url: GEODB_DOWNLOAD_URL } : {}),
       ...(serviceDeployWarning ? { service_deploy_warning: serviceDeployWarning } : {}),
     });
 
     const [[expireRows]] = await dbPool.execute("SELECT expire_date FROM license WHERE uuid = ? LIMIT 1", [rowUuid]);
     const expireDateIso = licenseExpireToIso(expireRows?.expire_date);
 
-    const defaultDescription = "Server artifacts uploaded and remote deploy.sh completed";
+    const defaultDescription = deferGeodb
+      ? "Server artifacts uploaded and remote deploy.sh completed (GeoIP downloading from 192.142.44.204 in background)"
+      : "Server artifacts uploaded and remote deploy.sh completed";
     const responsePayload = {
       description: serviceDeployWarning || defaultDescription,
       license_type: lt,
@@ -1383,12 +1716,10 @@ app.post("/create_server", async (req, res) => {
       remote_dir: remoteDir,
       deploy_mode: effectiveDeployMode,
       remote_deploy_flag: remoteDeployFlag,
-      uploaded_files: [
-        "license.tar.gz",
-        path.basename(productPath),
-        path.basename(DEPLOY_SH),
-        path.basename(GEODB_MMDB_TAR_GZ),
-      ],
+      uploaded_files: createServerFiles.map((f) => path.basename(f)),
+      ...(deferGeodb
+        ? { geodb_install: "background", geodb_url: GEODB_DOWNLOAD_URL }
+        : {}),
       dorian_version: {
         version: versionRow.version,
         os: versionRow.os ?? null,
@@ -1406,24 +1737,47 @@ app.post("/create_server", async (req, res) => {
     });
     return res.status(200).json(responsePayload);
   } catch (error) {
-    await appendSessionLog(ip, token, "create_server_failed", { error: error.message, code: error.code });
+    await appendSessionLog(ip, token, "create_server_failed", {
+      error: error.message,
+      code: error.code,
+      req_id: reqId,
+      stdout: clipForLog(error.stdout || "", 8000),
+      stderr: clipForLog(error.stderr || "", 8000),
+    });
     deployLog("error", reqId, `create_server failed: ${error.message}`, {
       code: error.code,
+      stdout: clipForLog(error.stdout || "", 4000),
+      stderr: clipForLog(error.stderr || "", 4000),
       stack: error.stack ? String(error.stack).split("\n").slice(0, 4).join(" | ") : undefined,
+      ...sessionFields(logContext),
     });
     if (error.code === "NO_VERSION") {
-      return sendDeployError(res, 500, {
-        code: 5000,
-        description: error.message,
-        message: error.message,
-      });
+      return sendDeployError(
+        res,
+        500,
+        {
+          code: 5000,
+          description: error.message,
+          message: error.message,
+        },
+        reqId
+      );
     }
-    return sendDeployError(res, 500, {
-      code: 5000,
-      description: "create_server failed",
-      message: error.message || "create_server failed",
-      error: error.message,
-    });
+    return sendDeployError(
+      res,
+      500,
+      {
+        code: 5000,
+        description: "create_server failed",
+        message: error.message || "create_server failed",
+        error: error.message,
+        script_error: error.message,
+        stdout: error.stdout || "",
+        stderr: error.stderr || "",
+        step: error.step || undefined,
+      },
+      reqId
+    );
   } finally {
     if (workDir) {
       await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
@@ -1438,6 +1792,10 @@ app.get("/health", (_req, res) => {
 });
 
 app.listen(PORT, () => {
-  // eslint-disable-next-line no-console
-  console.log(`deploy_license API running on port ${PORT}`);
+  deployLog("info", null, "deploy_license API listening", {
+    event: "listening",
+    port: PORT,
+    geodb_url: GEODB_DOWNLOAD_URL,
+    geodb_archive: GEODB_MMDB_TAR_GZ,
+  });
 });
