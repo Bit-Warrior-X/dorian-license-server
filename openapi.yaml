@@ -144,7 +144,7 @@ components:
   schemas:
     CreateServerRequest:
       type: object
-      required: [name, ip, user, pass, ssh_port, license_type, token]
+      required: [name, ip, user, ssh_port, license_type, token]
       additionalProperties: false
       properties:
         name:
@@ -155,6 +155,9 @@ components:
           type: string
         pass:
           type: string
+        ssh_key:
+          type: string
+          description: Unencrypted SSH private key (PEM) used with ssh -i. Either pass or ssh_key is required; when both are set the key is tried first.
         ssh_port:
           oneOf:
             - type: string
@@ -190,7 +193,7 @@ components:
             Row uuid from versions (from get_versions). When omitted, the newest versions row is used.
     UpgradeLicenseRequest:
       type: object
-      required: [name, ip, user, pass, ssh_port, token, license_type]
+      required: [name, ip, user, ssh_port, token, license_type]
       additionalProperties: false
       properties:
         name:
@@ -201,6 +204,9 @@ components:
           type: string
         pass:
           type: string
+        ssh_key:
+          type: string
+          description: Unencrypted SSH private key (PEM) used with ssh -i. Either pass or ssh_key is required; when both are set the key is tried first.
         ssh_port:
           oneOf:
             - type: string
@@ -213,7 +219,7 @@ components:
           description: New tier to generate and deploy for this token (case-insensitive).
     UpgradeVersionRequest:
       type: object
-      required: [name, ip, user, pass, ssh_port, token, version_uuid]
+      required: [name, ip, user, ssh_port, token, version_uuid]
       additionalProperties: false
       properties:
         name:
@@ -224,6 +230,9 @@ components:
           type: string
         pass:
           type: string
+        ssh_key:
+          type: string
+          description: Unencrypted SSH private key (PEM) used with ssh -i. Either pass or ssh_key is required; when both are set the key is tried first.
         ssh_port:
           oneOf:
             - type: string

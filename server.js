@@ -196,13 +196,14 @@ const apiSpec = YAML.load(path.join(__dirname, "openapi.yaml"));
 
 const validateCreateServer = ajv.compile({
   type: "object",
-  required: ["name", "ip", "user", "pass", "ssh_port", "license_type", "token"],
+  required: ["name", "ip", "user", "ssh_port", "license_type", "token"],
   additionalProperties: false,
   properties: {
     name: { type: "string", minLength: 1 },
     ip: { type: "string", minLength: 1 },
     user: { type: "string", minLength: 1 },
-    pass: { type: "string", minLength: 1 },
+    pass: { type: "string" },
+    ssh_key: { type: "string" },
     ssh_port: { anyOf: [{ type: "string", minLength: 1 }, { type: "number" }] },
     license_type: { type: "string", minLength: 1 },
     license_string: { type: "string" },
@@ -216,13 +217,14 @@ const validateCreateServer = ajv.compile({
 
 const validateUpgradeVersion = ajv.compile({
   type: "object",
-  required: ["name", "ip", "user", "pass", "ssh_port", "token", "version_uuid"],
+  required: ["name", "ip", "user", "ssh_port", "token", "version_uuid"],
   additionalProperties: false,
   properties: {
     name: { type: "string", minLength: 1 },
     ip: { type: "string", minLength: 1 },
     user: { type: "string", minLength: 1 },
-    pass: { type: "string", minLength: 1 },
+    pass: { type: "string" },
+    ssh_key: { type: "string" },
     ssh_port: { anyOf: [{ type: "string", minLength: 1 }, { type: "number" }] },
     token: { type: "string", minLength: 1 },
     version_uuid: { type: "string", minLength: 1 },
@@ -232,13 +234,14 @@ const validateUpgradeVersion = ajv.compile({
 
 const validateUpgradeLicense = ajv.compile({
   type: "object",
-  required: ["name", "ip", "user", "pass", "ssh_port", "token", "license_type"],
+  required: ["name", "ip", "user", "ssh_port", "token", "license_type"],
   additionalProperties: false,
   properties: {
     name: { type: "string", minLength: 1 },
     ip: { type: "string", minLength: 1 },
     user: { type: "string", minLength: 1 },
-    pass: { type: "string", minLength: 1 },
+    pass: { type: "string" },
+    ssh_key: { type: "string" },
     ssh_port: { anyOf: [{ type: "string", minLength: 1 }, { type: "number" }] },
     token: { type: "string", minLength: 1 },
     license_type: { type: "string", minLength: 1 },
@@ -364,7 +367,7 @@ function runCommand(cmd, args, options = {}) {
   });
 }
 
-function runGenerateLicenseScript({ ip, user, pass, sshPort, licenseType, durationDays, feature, logContext }) {
+function runGenerateLicenseScript({ ip, user, auth, sshPort, licenseType, durationDays, feature, logContext }) {
   return new Promise((resolve, reject) => {
     if (logContext?.reqId) {
       deployLog("info", logContext.reqId, "generate_license.sh starting", {
@@ -386,11 +389,15 @@ function runGenerateLicenseScript({ ip, user, pass, sshPort, licenseType, durati
       String(ip),
       "--user",
       String(user),
-      "--pass",
-      String(pass),
       "--ssh_port",
       String(sshPort),
     ];
+    if (auth.pass) {
+      scriptArgs.push("--pass", String(auth.pass));
+    }
+    if (auth.keyFile) {
+      scriptArgs.push("--key_file", auth.keyFile);
+    }
     if (feature != null) {
       scriptArgs.push("--feature", String(feature));
     }
@@ -531,13 +538,57 @@ const SSH_OPTS = [
   "ServerAliveCountMax=4",
 ];
 
-async function ensureRemoteDir({ ip, user, pass, sshPort, remoteDir, logContext }) {
-  await runCommand(
-    "sshpass",
+function hasSshCredential(body = {}) {
+  return String(body.pass || "") !== "" || String(body.ssh_key || "").trim() !== "";
+}
+
+function missingSshCredential(res) {
+  return res.status(400).json({
+    description: "invalid request payload",
+    message: "either pass (SSH password) or ssh_key (SSH private key) is required",
+  });
+}
+
+/**
+ * SSH credentials for one request. A private key is written to a private temp file
+ * for `ssh -i`; call close() to remove it. When both are given the key is tried first
+ * and sshpass answers a password prompt if the key is rejected.
+ */
+async function openSshAuth({ pass, ssh_key: sshKey } = {}) {
+  const password = String(pass || "");
+  const key = String(sshKey || "").trim();
+  if (!key) {
+    return { pass: password, keyFile: null, close: async () => {} };
+  }
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "deploy_license-sshkey-"));
+  const keyFile = path.join(dir, "id_key");
+  await fs.writeFile(keyFile, `${key}\n`, { mode: 0o600 });
+  return {
+    pass: password,
+    keyFile,
+    close: () => fs.rm(dir, { recursive: true, force: true }).catch(() => {}),
+  };
+}
+
+/** Build the command line for ssh/scp with the request's credentials. */
+function sshInvocation(auth, tool, args) {
+  const keyArgs = auth.keyFile ? ["-i", auth.keyFile, "-o", "IdentitiesOnly=yes"] : [];
+  if (auth.pass) {
+    return ["sshpass", ["-p", String(auth.pass), tool, ...keyArgs, ...args]];
+  }
+  return [tool, [...keyArgs, "-o", "BatchMode=yes", ...args]];
+}
+
+function runSsh(auth, tool, args, options) {
+  const [cmd, argv] = sshInvocation(auth, tool, args);
+  return runCommand(cmd, argv, options);
+}
+
+async function ensureRemoteDir({ ip, user, auth, sshPort, remoteDir, logContext }) {
+  await runSsh(
+    auth,
+    "ssh",
     [
-      "-p",
-      String(pass),
-      "ssh",
       ...SSH_OPTS,
       "-p",
       String(sshPort),
@@ -549,14 +600,12 @@ async function ensureRemoteDir({ ip, user, pass, sshPort, remoteDir, logContext 
 }
 
 /** Reuse of remoteDir (e.g. upgrade_version) leaves prior dorian-*.tar.gz; deploy.sh requires exactly one match. */
-async function removeRemoteDorianTarballs({ ip, user, pass, sshPort, remoteDir, logContext }) {
+async function removeRemoteDorianTarballs({ ip, user, auth, sshPort, remoteDir, logContext }) {
   const cmd = `cd -- ${JSON.stringify(remoteDir)} && rm -f dorian-ddos-firewall-*.tar.gz`;
-  await runCommand(
-    "sshpass",
+  await runSsh(
+    auth,
+    "ssh",
     [
-      "-p",
-      String(pass),
-      "ssh",
       ...SSH_OPTS,
       "-p",
       String(sshPort),
@@ -567,7 +616,7 @@ async function removeRemoteDorianTarballs({ ip, user, pass, sshPort, remoteDir, 
   );
 }
 
-async function scpFilesToRemote({ ip, user, pass, sshPort, localFiles, remoteDir, logContext }) {
+async function scpFilesToRemote({ ip, user, auth, sshPort, localFiles, remoteDir, logContext }) {
   if (!localFiles.length) {
     return;
   }
@@ -581,9 +630,10 @@ async function scpFilesToRemote({ ip, user, pass, sshPort, localFiles, remoteDir
       fileMeta.push({ name: path.basename(f), bytes: null });
     }
   }
-  await runCommand(
-    "sshpass",
-    ["-p", String(pass), "scp", ...SSH_OPTS, "-P", String(sshPort), ...localFiles, dest],
+  await runSsh(
+    auth,
+    "scp",
+    [...SSH_OPTS, "-P", String(sshPort), ...localFiles, dest],
     {
       logContext: {
         ...logContext,
@@ -597,14 +647,12 @@ async function scpFilesToRemote({ ip, user, pass, sshPort, localFiles, remoteDir
 }
 
 /** True when the remote already has GeoIP MMDB files (skip re-uploading ~480MB). */
-async function remoteGeodbInstalled({ ip, user, pass, sshPort, logContext }) {
+async function remoteGeodbInstalled({ ip, user, auth, sshPort, logContext }) {
   try {
-    await runCommand(
-      "sshpass",
+    await runSsh(
+      auth,
+      "ssh",
       [
-        "-p",
-        String(pass),
-        "ssh",
         ...SSH_OPTS,
         "-p",
         String(sshPort),
@@ -631,14 +679,14 @@ async function buildRemoteUploadFiles({
   includeGeodb,
   ip,
   user,
-  pass,
+  auth,
   sshPort,
   logContext,
 }) {
   const localFiles = [tarballPath, productPath, DEPLOY_SH].filter(Boolean);
   let deferGeodb = false;
   if (includeGeodb) {
-    const already = await remoteGeodbInstalled({ ip, user, pass, sshPort, logContext });
+    const already = await remoteGeodbInstalled({ ip, user, auth, sshPort, logContext });
     if (already) {
       deployLog("info", logContext?.reqId, "skipping GeoIP; MMDB already present on remote");
     } else {
@@ -652,7 +700,16 @@ async function buildRemoteUploadFiles({
 }
 
 /** Background: target curls GeoIP from 192.142.44.204 and extracts it. */
-async function installRemoteGeodb({ ip, user, pass, sshPort, logContext }) {
+async function installRemoteGeodb({ ip, user, credentials, sshPort, logContext }) {
+  const auth = await openSshAuth(credentials);
+  try {
+    await installRemoteGeodbWithAuth({ ip, user, auth, sshPort, logContext });
+  } finally {
+    await auth.close();
+  }
+}
+
+async function installRemoteGeodbWithAuth({ ip, user, auth, sshPort, logContext }) {
   const t0 = Date.now();
   deployLog("info", logContext?.reqId, "background GeoIP download starting", {
     component: "geodb",
@@ -666,7 +723,7 @@ async function installRemoteGeodb({ ip, user, pass, sshPort, logContext }) {
       req_id: logContext.reqId,
     });
   }
-  if (await remoteGeodbInstalled({ ip, user, pass, sshPort, logContext })) {
+  if (await remoteGeodbInstalled({ ip, user, auth, sshPort, logContext })) {
     deployLog("info", logContext?.reqId, "background GeoIP skipped; MMDB already present", {
       component: "geodb",
       duration_ms: Date.now() - t0,
@@ -686,12 +743,10 @@ async function installRemoteGeodb({ ip, user, pass, sshPort, logContext }) {
     `rm -f -- ${JSON.stringify(remoteTar)}`,
     `echo "geodb_ok files=$(find ${JSON.stringify(geoDir)} -name '*.mmdb' | wc -l)"`,
   ].join(" && ");
-  await runCommand(
-    "sshpass",
+  await runSsh(
+    auth,
+    "ssh",
     [
-      "-p",
-      String(pass),
-      "ssh",
       ...SSH_OPTS,
       "-p",
       String(sshPort),
@@ -792,15 +847,16 @@ function deployModeToRemoteFlag(deployMode) {
   return null;
 }
 
-async function runRemoteDeployScript({ ip, user, pass, sshPort, remoteDir, deployFlag, env = {}, logContext }) {
+async function runRemoteDeployScript({ ip, user, auth, sshPort, remoteDir, deployFlag, env = {}, logContext }) {
   const envPrefix = Object.entries(env)
     .filter(([, v]) => v != null && v !== "")
     .map(([k, v]) => `${k}=${JSON.stringify(String(v))}`)
     .join(" ");
   const remoteShell = `cd -- ${JSON.stringify(remoteDir)} && ${envPrefix ? `${envPrefix} ` : ""}bash deploy.sh ${deployFlag}`;
-  const result = await runCommand(
-    "sshpass",
-    ["-p", String(pass), "ssh", ...SSH_OPTS, "-p", String(sshPort), `${user}@${ip}`, remoteShell],
+  const result = await runSsh(
+    auth,
+    "ssh",
+    [...SSH_OPTS, "-p", String(sshPort), `${user}@${ip}`, remoteShell],
     {
       logContext: {
         ...logContext,
@@ -966,6 +1022,10 @@ app.post("/upgrade_license", async (req, res) => {
     });
     return validationError(res, validateUpgradeLicense);
   }
+  if (!hasSshCredential(req.body)) {
+    deployLog("warn", reqId, "upgrade_license: neither pass nor ssh_key supplied");
+    return missingSshCredential(res);
+  }
 
   const lt = String(license_type).toLowerCase();
   const ltConfig = LICENSE_TYPES[lt];
@@ -977,7 +1037,9 @@ app.post("/upgrade_license", async (req, res) => {
   }
 
   let workDir;
+  let sshAuth;
   try {
+    sshAuth = await openSshAuth(req.body);
     const [licRows] = await dbPool.execute(
       "SELECT uuid, machine_id FROM license WHERE token = ? LIMIT 1",
       [token]
@@ -1030,7 +1092,7 @@ app.post("/upgrade_license", async (req, res) => {
       genOut = await runGenerateLicenseScript({
         ip,
         user,
-        pass,
+        auth: sshAuth,
         sshPort: ssh_port,
         licenseType: lt,
         durationDays,
@@ -1068,7 +1130,7 @@ app.post("/upgrade_license", async (req, res) => {
       name,
       ip,
       user,
-      pass,
+      pass: pass || "",
       sshPort: ssh_port,
       machineId,
       licenseContent,
@@ -1123,21 +1185,21 @@ app.post("/upgrade_license", async (req, res) => {
       tarball: path.basename(tarballPath),
       product: path.basename(productPath),
     });
-    await ensureRemoteDir({ ip, user, pass, sshPort: ssh_port, remoteDir, logContext });
+    await ensureRemoteDir({ ip, user, auth: sshAuth, sshPort: ssh_port, remoteDir, logContext });
     const { localFiles: upgradeLicenseFiles } = await buildRemoteUploadFiles({
       tarballPath,
       productPath,
       includeGeodb: false,
       ip,
       user,
-      pass,
+      auth: sshAuth,
       sshPort: ssh_port,
       logContext,
     });
     await scpFilesToRemote({
       ip,
       user,
-      pass,
+      auth: sshAuth,
       sshPort: ssh_port,
       localFiles: upgradeLicenseFiles,
       remoteDir,
@@ -1150,7 +1212,7 @@ app.post("/upgrade_license", async (req, res) => {
       await runRemoteDeployScript({
         ip,
         user,
-        pass,
+        auth: sshAuth,
         sshPort: ssh_port,
         remoteDir,
         deployFlag: remoteDeployFlag,
@@ -1214,6 +1276,7 @@ app.post("/upgrade_license", async (req, res) => {
     if (workDir) {
       await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
     }
+    await sshAuth?.close();
   }
 });
 
@@ -1228,9 +1291,15 @@ app.post("/upgrade_version", async (req, res) => {
     });
     return validationError(res, validateUpgradeVersion);
   }
+  if (!hasSshCredential(req.body)) {
+    deployLog("warn", reqId, "upgrade_version: neither pass nor ssh_key supplied");
+    return missingSshCredential(res);
+  }
 
   let workDir;
+  let sshAuth;
   try {
+    sshAuth = await openSshAuth(req.body);
     try {
       await fs.access(DEPLOY_SH);
     } catch {
@@ -1277,7 +1346,7 @@ app.post("/upgrade_version", async (req, res) => {
       machineId = licRow.machine_id;
       await dbPool.execute(
         `UPDATE license SET name = ?, ip = ?, user = ?, password = ?, ssh_port = ?, updated = CURRENT_TIMESTAMP WHERE token = ?`,
-        [name, ip, user, pass, Number(ssh_port), token]
+        [name, ip, user, pass || "", Number(ssh_port), token]
       );
     }
 
@@ -1296,12 +1365,12 @@ app.post("/upgrade_version", async (req, res) => {
       product: path.basename(productPath),
       version: versionRow.version,
     });
-    await ensureRemoteDir({ ip, user, pass, sshPort: ssh_port, remoteDir, logContext });
-    await removeRemoteDorianTarballs({ ip, user, pass, sshPort: ssh_port, remoteDir, logContext });
+    await ensureRemoteDir({ ip, user, auth: sshAuth, sshPort: ssh_port, remoteDir, logContext });
+    await removeRemoteDorianTarballs({ ip, user, auth: sshAuth, sshPort: ssh_port, remoteDir, logContext });
     await scpFilesToRemote({
       ip,
       user,
-      pass,
+      auth: sshAuth,
       sshPort: ssh_port,
       localFiles: [productPath, DEPLOY_SH],
       remoteDir,
@@ -1314,7 +1383,7 @@ app.post("/upgrade_version", async (req, res) => {
       await runRemoteDeployScript({
         ip,
         user,
-        pass,
+        auth: sshAuth,
         sshPort: ssh_port,
         remoteDir,
         deployFlag: remoteDeployFlag,
@@ -1386,6 +1455,7 @@ app.post("/upgrade_version", async (req, res) => {
     if (workDir) {
       await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
     }
+    await sshAuth?.close();
   }
 });
 
@@ -1398,6 +1468,10 @@ app.post("/create_server", async (req, res) => {
       errors: validateCreateServer.errors,
     });
     return validationError(res, validateCreateServer);
+  }
+  if (!hasSshCredential(req.body)) {
+    deployLog("warn", reqId, "create_server: neither pass nor ssh_key supplied");
+    return missingSshCredential(res);
   }
 
   const lt = String(license_type).toLowerCase();
@@ -1437,7 +1511,9 @@ app.post("/create_server", async (req, res) => {
   const deployFlag = deployModeToRemoteFlag(deploy_mode);
 
   let workDir;
+  let sshAuth;
   try {
+    sshAuth = await openSshAuth(req.body);
     await appendSessionLog(ip, token, "create_server_received", {
       name,
       ssh_port,
@@ -1486,7 +1562,7 @@ app.post("/create_server", async (req, res) => {
         genOut = await runGenerateLicenseScript({
           ip,
           user,
-          pass,
+          auth: sshAuth,
           sshPort: ssh_port,
           licenseType: lt,
           durationDays,
@@ -1525,7 +1601,7 @@ app.post("/create_server", async (req, res) => {
         name,
         ip,
         user,
-        pass,
+        pass: pass || "",
         sshPort: ssh_port,
         machineId,
         licenseContent,
@@ -1577,7 +1653,7 @@ app.post("/create_server", async (req, res) => {
         name,
         ip,
         user,
-        pass,
+        pass: pass || "",
         sshPort: ssh_port,
         token,
       });
@@ -1629,21 +1705,21 @@ app.post("/create_server", async (req, res) => {
       tarball: path.basename(tarballPath),
       product: path.basename(productPath),
     });
-    await ensureRemoteDir({ ip, user, pass, sshPort: ssh_port, remoteDir, logContext });
+    await ensureRemoteDir({ ip, user, auth: sshAuth, sshPort: ssh_port, remoteDir, logContext });
     const { localFiles: createServerFiles, deferGeodb } = await buildRemoteUploadFiles({
       tarballPath,
       productPath,
       includeGeodb: true,
       ip,
       user,
-      pass,
+      auth: sshAuth,
       sshPort: ssh_port,
       logContext,
     });
     await scpFilesToRemote({
       ip,
       user,
-      pass,
+      auth: sshAuth,
       sshPort: ssh_port,
       localFiles: createServerFiles,
       remoteDir,
@@ -1658,7 +1734,7 @@ app.post("/create_server", async (req, res) => {
       await runRemoteDeployScript({
         ip,
         user,
-        pass,
+        auth: sshAuth,
         sshPort: ssh_port,
         remoteDir,
         deployFlag: remoteDeployFlag,
@@ -1684,7 +1760,7 @@ app.post("/create_server", async (req, res) => {
       scheduleRemoteGeodbInstall({
         ip,
         user,
-        pass,
+        credentials: { pass, ssh_key: req.body.ssh_key },
         sshPort: ssh_port,
         logContext,
       });
@@ -1782,6 +1858,7 @@ app.post("/create_server", async (req, res) => {
     if (workDir) {
       await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
     }
+    await sshAuth?.close();
   }
 });
 

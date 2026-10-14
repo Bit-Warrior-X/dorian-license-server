@@ -5,3 +5,11 @@ logs/
 .env
 .DS_Store
 /bin/licenses/*
+
+# Private keys must never be committed (license-signing keys are per deploy).
+/bin/secrets/
+/bin/server_private_key.pem
+/bin/server_public_key.pem
+**/secrets/
+*.key
+*private_key*.pem

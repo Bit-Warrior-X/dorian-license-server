@@ -2,7 +2,8 @@
 # generate_license.sh — obtain machine_id (or accept one), create a per-id folder, generate RSA keys, run mklicense.
 #
 # Required: --license_type trial|l4|l7|unified
-# If --machine_id is omitted, also required: --ip --user --pass --ssh_port
+# If --machine_id is omitted, also required: --ip --user --ssh_port and --pass and/or --key_file
+#   (--key_file is a private key file for ssh -i; when both are given the key is tried first)
 #
 # Optional:
 #   --feature N   override the feature bitmask. Default by license_type:
@@ -42,6 +43,7 @@ LICENSE_ROOT="${BIN_DIR}/licenses"
 IP=""
 USER=""
 PASS=""
+KEY_FILE=""
 SSH_PORT=""
 LICENSE_TYPE=""
 FEATURE=""
@@ -53,6 +55,7 @@ while [[ $# -gt 0 ]]; do
     --ip) IP="${2:-}"; shift 2 ;;
     --user) USER="${2:-}"; shift 2 ;;
     --pass) PASS="${2:-}"; shift 2 ;;
+    --key_file) KEY_FILE="${2:-}"; shift 2 ;;
     --ssh_port) SSH_PORT="${2:-}"; shift 2 ;;
     --license_type) LICENSE_TYPE="${2:-}"; shift 2 ;;
     --feature) FEATURE="${2:-}"; shift 2 ;;
@@ -98,11 +101,13 @@ if [[ -n "$MACHINE_ID_ARG" ]]; then
   MACHINE_ID="$MACHINE_ID_ARG"
 else
   FETCHED_REMOTE=1
-  [[ -n "$IP" && -n "$USER" && -n "$PASS" && -n "$SSH_PORT" ]] || fail "without --machine_id, --ip, --user, --pass, and --ssh_port are required"
+  [[ -n "$IP" && -n "$USER" && -n "$SSH_PORT" ]] || fail "without --machine_id, --ip, --user, and --ssh_port are required"
+  [[ -n "$PASS" || -n "$KEY_FILE" ]] || fail "without --machine_id, --pass or --key_file is required"
+  [[ -z "$KEY_FILE" || -f "$KEY_FILE" ]] || fail "SSH key file not found: ${KEY_FILE}"
   [[ -x "$GET_REMOTE" || -f "$GET_REMOTE" ]] || fail "missing get_remote script: ${GET_REMOTE}"
   remote_err_file="$(mktemp)"
   set +e
-  remote_out=$("$GET_REMOTE" "$IP" "$USER" "$PASS" "$SSH_PORT" 2>"$remote_err_file")
+  remote_out=$(SSH_KEY_FILE="$KEY_FILE" "$GET_REMOTE" "$IP" "$USER" "$PASS" "$SSH_PORT" 2>"$remote_err_file")
   remote_rc=$?
   set -e
   remote_err="$(tr '\n\r' '  ' <"$remote_err_file" | sed 's/  */ /g; s/^[[:space:]]*//; s/[[:space:]]*$//')"
@@ -156,6 +161,7 @@ GENERATED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
     echo "ssh_ip=${IP}"
     echo "ssh_user=${USER}"
     echo "ssh_port=${SSH_PORT}"
+    echo "ssh_auth=$([[ -n "$KEY_FILE" ]] && echo key || echo password)"
     echo "ssh_password_stored=no (not written to this file)"
   else
     echo "machine_id_source=explicit (--machine_id)"
